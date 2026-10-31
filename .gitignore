@@ -23,6 +23,9 @@ venv/
 env/
 ENV/
 
+# Logs
+*.log
+
 # Tooling caches
 .pytest_cache/
 .mypy_cache/
