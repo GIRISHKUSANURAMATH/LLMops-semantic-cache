@@ -52,7 +52,7 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: tests that exercise several components together (no network)",
     "e2e: tests that run the full HTTP application (no network)",
-    "live: tests that call a real external provider; skipped unless explicitly enabled",
+    "neural: tests that load a real sentence-transformers model; need RUN_NEURAL_TESTS=1",
 ]
 addopts = "-ra"
 
@@ -76,6 +76,9 @@ strict = true
 mypy_path = "src"
 packages = ["llmops_cache"]
 warn_unused_ignores = true
+# `mypy .` checks src/, scripts/ and examples/ strictly. Tests use untyped pytest fixtures
+# and are deliberately not type-checked.
+exclude = ['^tests/', '^\.venv/', '^build/', '^dist/']
 
 [[tool.mypy.overrides]]
 module = ["sentence_transformers.*", "prometheus_client.*"]

@@ -23,7 +23,9 @@ def build_embedding_provider(settings: Settings) -> EmbeddingProvider:
             SentenceTransformerEmbeddingProvider,
         )
 
-        return SentenceTransformerEmbeddingProvider(settings.embedding_model)
+        return SentenceTransformerEmbeddingProvider(
+            settings.embedding_model, device=settings.embedding_device
+        )
     from llmops_cache.embeddings.openai import OpenAIEmbeddingProvider
 
     assert settings.openai_api_key is not None  # noqa: S101 - enforced by Settings validator

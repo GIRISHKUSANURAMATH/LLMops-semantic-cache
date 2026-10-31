@@ -76,6 +76,8 @@ class InMemoryVectorStore(VectorStore):
     def __init__(self, max_entries: int = 10_000) -> None:
         self.max_entries = max_entries
         self.dimensions: int | None = None
+        #: Incremented on every mutation; lets the snapshot task skip unchanged indexes.
+        self.version = 0
         self._entries: dict[str, CacheEntry] = {}
         self._namespace_of: dict[str, str] = {}
         self._namespaces: dict[str, _Namespace] = {}
@@ -102,6 +104,7 @@ class InMemoryVectorStore(VectorStore):
         ns.ids.append(entry.id)
         self._entries[entry.id] = entry
         self._namespace_of[entry.id] = entry.context_key
+        self.version += 1
 
     def search(self, vector: Vector, context_key: str, top_k: int) -> list[SearchHit]:
         ns = self._namespaces.get(context_key)
@@ -126,6 +129,7 @@ class InMemoryVectorStore(VectorStore):
         if key is None:
             return False
         del self._entries[entry_id]
+        self.version += 1
         ns = self._namespaces[key]
         index = ns.ids.index(entry_id)
         ns.ids.pop(index)
@@ -137,6 +141,7 @@ class InMemoryVectorStore(VectorStore):
 
     def clear(self) -> int:
         count = len(self._entries)
+        self.version += 1
         self._entries.clear()
         self._namespace_of.clear()
         self._namespaces.clear()

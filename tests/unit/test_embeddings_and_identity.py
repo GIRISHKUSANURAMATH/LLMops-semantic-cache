@@ -31,6 +31,7 @@ def _key(**overrides: object) -> str:
         "temperature": 0.0,
         "max_tokens": 512,
         "namespace": None,
+        "embedding": "hashing-v1-512",
     }
     params.update(overrides)
     return context_key(**params)  # type: ignore[arg-type]
@@ -46,6 +47,7 @@ def test_context_key_is_stable_and_sensitive_to_every_field() -> None:
         ("temperature", 0.5),
         ("max_tokens", 10),
         ("namespace", "t1"),
+        ("embedding", "st-all-MiniLM-L6-v2"),
     ]:
         assert _key(**{field: value}) != base, field
 

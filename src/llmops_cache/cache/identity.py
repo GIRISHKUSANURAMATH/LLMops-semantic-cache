@@ -31,9 +31,11 @@ def context_key(
     temperature: float,
     max_tokens: int,
     namespace: str | None,
+    embedding: str = "",
 ) -> str:
     material = {
         "provider": provider,
+        "embedding": embedding,
         "model": model,
         "system_prompt": system_prompt or "",
         "temperature": round(temperature, 3),

@@ -29,7 +29,7 @@ python -m pip install -e ".[dev]"
 ```bash
 ruff check .
 ruff format --check .
-mypy
+mypy .                 # strict on src/, scripts/, examples/
 pytest
 ```
 

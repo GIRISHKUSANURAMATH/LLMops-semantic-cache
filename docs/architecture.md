@@ -44,8 +44,9 @@ Swapping FAISS/Qdrant for the NumPy store, or Gemini for OpenAI, means writing o
 2. **Bypass check** - `use_cache=false`, or `temperature > CACHE_MAX_TEMPERATURE`, goes straight
    to the LLM and nothing is stored.
 3. **Normalise** - NFKC, lower-case, collapse whitespace, strip trailing punctuation.
-4. **Context key** - SHA-256 of `provider, model, system_prompt, temperature, max_tokens,
-   namespace`. Search is restricted to entries with the *same* key (see below).
+4. **Context key** - SHA-256 of `provider identity (name + endpoint URL), model, system_prompt,
+   temperature, max_tokens, embedding model, namespace`. Search is restricted to entries with
+   the *same* key (see below).
 5. **Embed** the normalised query.
 6. **Search** the top `CACHE_TOP_K` entries by cosine similarity (vectors are unit length, so a
    dot product).
@@ -61,6 +62,20 @@ Swapping FAISS/Qdrant for the NumPy store, or Gemini for OpenAI, means writing o
 A cached answer is only valid if everything that shaped it is the same. Reusing an answer
 produced by a different model, a different system prompt or a different `max_tokens` would be
 a silent correctness bug, so those fields form the context key and partition the index.
+
+| Field | Why it is in the key |
+|---|---|
+| provider identity | `openai@https://api.openai.com/v1` and `openai@https://api.groq.com/openai/v1` can both serve a model called `llama-3.1-8b` that are not the same model |
+| model | resolved model name (`"default"` is resolved to `LLM_DEFAULT_MODEL` first, so changing the default does not reuse old answers) |
+| system_prompt | different instructions -> different answers |
+| temperature, max_tokens | change the shape/length of the answer |
+| embedding model | similarity scores from different embedders are not comparable |
+| namespace | caller-defined: tenant, prompt-template version, locale, RAG document hash... |
+
+Regression tests: `tests/unit/test_service.py` (`test_different_generation_context_never_shares_cache`,
+`test_same_model_name_on_different_endpoints_never_shares_cache`,
+`test_entries_from_another_embedding_model_are_not_matched`) and
+`tests/integration/test_api.py::test_changing_default_model_does_not_reuse_old_answers`.
 
 `namespace` lets the caller add anything else that matters: tenant id (prevents one customer's
 cached answer leaking to another), prompt-template version, locale, retrieved-document hash
@@ -104,11 +119,17 @@ Limitations, stated plainly:
 
 ## Persistence
 
-If `VECTOR_STORE_PATH` is set, the index is loaded on startup and saved on graceful shutdown
-as `entries.json` + `vectors.npy`. Writes are atomic (temp file + rename). `vectors.npy` is
+If `VECTOR_STORE_PATH` is **not** set (the default in code), the cache lives only in memory
+and is lost when the process stops. `.env.example` and `docker-compose.yml` set it, so those
+setups persist.
+
+If `VECTOR_STORE_PATH` is set, the index is loaded on startup and written as `entries.json` +
+`vectors.npy`: every `CACHE_SNAPSHOT_INTERVAL_SECONDS` (default 30) **if it changed**, and again
+on graceful shutdown. Writes are atomic (temp file + rename). `vectors.npy` is
 loaded with `allow_pickle=False`, so a tampered file cannot execute code. The index is
 discarded on load if the embedding model changed (vectors from different models are not
-comparable). A crash loses entries created since the last clean shutdown.
+comparable). A crash or hard kill loses at most one snapshot interval of new entries; hit
+counters alone do not trigger a snapshot.
 
 ## Eviction
 
@@ -116,12 +137,20 @@ comparable). A crash loses entries created since the last clean shutdown.
 `last_accessed_at`, falling back to `created_at`) is evicted. A background task purges expired
 entries every `CACHE_CLEANUP_INTERVAL_SECONDS`; `DELETE /v1/cache/expired` does it on demand.
 
+## Exact match vs lexical vs neural
+
+There is no separate exact-match layer: identical normalised text embeds to the identical
+vector (similarity 1.0), so exact repeats are always hits. What the embedder decides is how
+*different* wording is treated. The default lexical embedder measures word overlap; the
+optional neural embedder measures learned meaning. `docs/evaluation.md` measures how much of the
+cache's benefit comes from each.
+
 ## Embedding providers
 
 | Provider | Semantics | Needs |
 |---|---|---|
 | `hashing` (default) | **Lexical**: feature hashing of stemmed content words, bigrams and character trigrams, with stop/question-framing words removed. Catches rewordings that share content words; misses synonyms (`car` vs `automobile` scores 0.0). | Nothing. Deterministic, offline. |
-| `sentence-transformers` | Neural sentence embeddings (default `all-MiniLM-L6-v2`). Handles synonyms. | `pip install -e ".[sentence-transformers]"`, model download on first run. |
+| `sentence-transformers` | Neural sentence embeddings (default `all-MiniLM-L6-v2`, on `EMBEDDING_DEVICE=cpu` by default for reproducibility). Expected to handle synonyms; **not yet measured against the real model**. | `pip install -e ".[sentence-transformers]"` (PyTorch), one-time ~90 MB model download into `HF_HOME`. Load/download failures raise a clear `EmbeddingError` at startup. |
 | `openai` | Any OpenAI-compatible `/embeddings` endpoint. | `OPENAI_API_KEY`. |
 
 The hashing provider exists so the full system - including the test suite and CI - works with

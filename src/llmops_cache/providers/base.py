@@ -35,6 +35,11 @@ class GenerationResult:
 class LLMProvider(ABC):
     name: str
 
+    @property
+    def cache_identity(self) -> str:
+        """What must match for two calls to be interchangeable (provider + endpoint)."""
+        return self.name
+
     @abstractmethod
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         """Return a full completion. Streaming is intentionally not part of this interface yet."""

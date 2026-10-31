@@ -5,9 +5,14 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 A FastAPI service that sits between your application and an LLM API. When a new prompt is
-*semantically similar* to one answered before - and was asked under the same model, system
-prompt and generation settings - it returns the cached answer in under a millisecond instead
-of paying for another LLM call.
+*similar enough* to one answered before - by embedding cosine similarity, and only under the
+same provider, model, system prompt and generation settings - it returns the cached answer in
+under a millisecond instead of paying for another LLM call.
+
+> **Two embedding modes.** The default embedder is **lexical** (word overlap, offline, no
+> model download): it catches rewordings that share words but **not synonyms**. A **neural**
+> embedder (`sentence-transformers`) is available as an option for real semantic similarity.
+> See [Which embedder?](#which-embedder-lexical-vs-neural).
 
 ---
 
@@ -48,15 +53,19 @@ identity, request coalescing, cost/latency metrics, structured logs, evaluation,
 and CI.
 
 It runs out of the box with **no API key and no network**: a deterministic mock LLM and a
-built-in embedding model are the defaults. Point it at OpenAI or any OpenAI-compatible
+built-in lexical embedder are the defaults. Point it at OpenAI or any OpenAI-compatible
 endpoint (Groq, vLLM, Ollama...) with two environment variables.
 
 ## 2. Why semantic caching?
 
 LLM calls are slow (hundreds of ms to seconds) and billed per token. Real traffic repeats
 itself - support bots, FAQ assistants and internal tools see the same questions phrased many
-ways. A plain key-value cache only catches byte-identical prompts; a semantic cache also
+ways. A plain key-value cache only catches byte-identical prompts; a similarity cache also
 catches "What is machine learning?" -> "Explain machine learning to me."
+
+Be realistic about where savings come from: in this project's own benchmark, **155 of 160
+cache hits were exact repeats** that a plain exact-match cache would also have served; the
+similarity layer added 5 (see [section 18](#18-performance--evaluation)).
 
 ## 3. Problem statement
 
@@ -84,6 +93,38 @@ For every `POST /v1/chat`:
 
 Details: [docs/architecture.md](docs/architecture.md).
 
+### Which embedder? Lexical vs neural
+
+| | `hashing` (default) | `sentence-transformers` (optional) |
+|---|---|---|
+| Kind | **Lexical**: weighted overlap of content words, stems, word pairs, character trigrams | **Neural**: learned sentence embeddings (default model `all-MiniLM-L6-v2`) |
+| Catches | Rewordings that share words: "What is ML?" / "Explain ML to me" | Also synonyms and paraphrases: "car" / "automobile" |
+| Misses | Synonyms ("What is a car?" / "Describe an automobile" scores **0.0**); weak on word order | Depends on the model; still not "identical intent" |
+| Install | Nothing extra | `python -m pip install -e ".[sentence-transformers]"` (pulls PyTorch, roughly 1 GB on disk) |
+| Network | Never | Once, to download the model (~90 MB) into the Hugging Face cache (`HF_HOME`); offline afterwards |
+| Deterministic | Yes, on every OS | Yes on CPU (`EMBEDDING_DEVICE=cpu`, the default) |
+| Used by tests/CI | Yes | Only with a fake model; the real-model test is opt-in (`RUN_NEURAL_TESTS=1`) |
+
+**Why the lexical default exists:** so that cloning, testing, CI and the demo work with zero
+downloads, no GPU and no API key, and give identical numbers on every machine. It is a
+baseline, not full semantic understanding.
+
+**Enable the neural embedder:**
+
+```bash
+python -m pip install -e ".[sentence-transformers]"
+python scripts/neural_check.py        # downloads the model once, prints real similarities
+```
+
+then set `EMBEDDING_PROVIDER=sentence-transformers` in `.env` and restart. Re-tune
+`CACHE_SIMILARITY_THRESHOLD` with `python scripts/evaluate_threshold.py --embedding-provider
+sentence-transformers`: neural similarity scores are on a different scale. Switching embedders
+invalidates a persisted index (vectors from different models are not comparable), and the
+embedder is part of the cache key.
+
+**Status:** the neural path is unit-tested with a fake model, but has **not yet been run against
+the real model**. Real similarity values are recorded by `verify_windows.ps1`.
+
 ## 5. Architecture diagram
 
 ```mermaid
@@ -105,12 +146,14 @@ flowchart TD
 
 ## 6. Features
 
-- **Real semantic matching** via embeddings + cosine similarity, not string comparison.
+- **Similarity matching** via embeddings + cosine similarity, not string comparison; lexical
+  by default, neural optional (see [Which embedder?](#which-embedder-lexical-vs-neural)).
 - **Pluggable** `EmbeddingProvider`, `LLMProvider` and `VectorStore` interfaces.
   - Embeddings: built-in `hashing` (offline, deterministic), `sentence-transformers`, OpenAI.
   - LLMs: `mock` (free, deterministic) and any OpenAI-compatible `/chat/completions` API.
-- **Cache safety**: context key (model, system prompt, temperature, max_tokens, namespace),
-  high-temperature bypass, per-request `use_cache=false`.
+- **Cache safety**: context key (provider + endpoint, model, system prompt, temperature,
+  max_tokens, embedding model, namespace), high-temperature bypass, per-request
+  `use_cache=false`.
 - **TTL** per entry (global default + per-request override); expired entries are never served.
 - **Invalidation**: clear all, delete by id, purge expired, background cleanup, LRU eviction.
 - **Single-flight**: N concurrent identical requests -> 1 LLM call.
@@ -120,8 +163,10 @@ flowchart TD
 - **Structured JSON logs** with prompt fingerprints instead of prompt text.
 - **Security**: optional API-key auth, CORS off by default, body-size limits, strict input
   validation, no tracebacks to clients, secrets masked, pickle-free persistence.
-- **Optional persistence** of the index across restarts.
-- 113 deterministic tests (unit, integration, e2e) that need no network or API key.
+- **Optional persistence** of the index across restarts (snapshot every
+  `CACHE_SNAPSHOT_INTERVAL_SECONDS` plus on graceful shutdown) when `VECTOR_STORE_PATH` is set.
+  Without it the cache is in memory only and is lost on restart.
+- Deterministic tests (unit, integration, e2e) that need no network or API key.
 
 ## 7. Tech stack
 
@@ -159,7 +204,9 @@ llmops-semantic-cache/
 │   ├── integration/         # HTTP API in-process
 │   └── e2e/                 # real uvicorn process, CLI, demo and scripts
 ├── examples/demo.py
-├── scripts/                 # benchmark.py, evaluate_threshold.py, data/semantic_pairs.json
+├── scripts/                 # benchmark.py, evaluate_threshold.py, smoke_test.py,
+│                            # neural_check.py, data/semantic_pairs.json
+├── verify_windows.ps1       # one-shot Windows verification -> windows_verification.log
 ├── docs/                    # architecture.md, api.md, evaluation.md
 ├── data/.gitkeep            # runtime index location (git-ignored)
 ├── .github/workflows/ci.yml
@@ -195,7 +242,8 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-Optional neural embeddings (downloads PyTorch, large):
+Optional neural embeddings (downloads PyTorch, large; see
+[Which embedder?](#which-embedder-lexical-vs-neural)):
 
 ```bash
 python -m pip install -e ".[sentence-transformers]"
@@ -239,7 +287,9 @@ uvicorn llmops_cache.main:create_app --factory --reload
 
 ## 12. Running with Docker
 
-Docker is optional.
+Docker is optional. **Status: the image build has not yet been verified** (the build
+environment used so far had no registry access); `verify_windows.ps1` tests it when Docker is
+installed.
 
 ```bash
 docker compose up --build
@@ -380,14 +430,29 @@ the reason the threshold matters.
 ## 17. Testing
 
 ```bash
-pytest                      # all 113 tests
+pytest                      # full suite (2 opt-in neural tests are skipped)
 pytest tests/unit           # engine, store, embeddings, providers, config
 pytest -m integration       # HTTP API in-process
 pytest -m e2e               # real server process, CLI, demo, scripts
 ruff check .
 ruff format --check .
-mypy
+mypy .                      # strict on src/, scripts/, examples/ (tests are excluded)
+python scripts/smoke_test.py --url http://127.0.0.1:8000   # against a running server
 ```
+
+**Windows one-shot verification.** From the project folder in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\verify_windows.ps1
+```
+
+It creates a fresh `.venv`, installs, runs pytest/Ruff/mypy/pip-audit, starts the real server
+and checks MISS/HIT/different-query, TTL, concurrency and restart persistence over HTTP, runs
+the demo and benchmark, tries the neural embedder in a separate throw-away venv, builds and
+tests the Docker image if Docker is running, and repeats install/test/run from a fresh
+`git clone`. Everything is written to `windows_verification.log` with PASS / FAIL /
+NOT VERIFIED / NOT AVAILABLE per check. It never pushes to GitHub. Takes roughly 10-20 minutes
+(most of it the optional PyTorch download; skip with `-SkipNeural`).
 
 No test needs internet, an API key or Docker. Tests use a mock LLM with a call counter to
 prove when the LLM is and isn't called, a fake clock for TTL, and an exact-angle test embedder
@@ -395,7 +460,9 @@ to place two queries at precisely 0.92 similarity for threshold tests.
 
 What is covered: miss/hit/different-query, threshold borderline (0.85/0.90/0.92/0.93/0.95),
 TTL expiry and expiry ranking, context-key isolation (model, system prompt, temperature,
-max_tokens, namespace), clear/delete/purge, LRU eviction, persistence + pickle refusal,
+max_tokens, namespace, embedding model, endpoint), clear/delete/purge, LRU eviction,
+persistence (shutdown save and periodic snapshot) + pickle refusal, the sentence-transformers
+provider with a fake model,
 provider failure (502/503), embedding and vector-store failure (fail-open), concurrency
 (single-flight, leader failure, leader cancellation), metrics accuracy, validation (422),
 malformed JSON, oversized bodies (413), API-key auth, CORS, secret masking, no prompt text in
@@ -406,16 +473,29 @@ logs, OpenAPI/Swagger/ReDoc.
 Reproducible with `python scripts/benchmark.py` and `python scripts/evaluate_threshold.py`.
 Full write-up, environment and caveats: [docs/evaluation.md](docs/evaluation.md).
 
-Simulated workload (200 Zipf-distributed requests, mock LLM at 50 ms, threshold 0.90):
+Simulated workload: 200 Zipf-distributed requests, mock LLM at 50 ms, default lexical
+embedder, threshold 0.90.
 
-| metric | without cache | with semantic cache |
-|---|---:|---:|
-| LLM calls | 200 | 34 |
-| hit rate | 0% | 83% (30 of 166 hits were paraphrases; the rest exact repeats) |
-| mean latency | 50.51 ms | 8.77 ms |
-| p50 latency | 50.48 ms | 0.14 ms |
+| strategy | LLM calls |
+|---|---:|
+| no cache | 200 |
+| exact-match cache (one call per distinct phrasing) | 45 |
+| this semantic cache | 40 |
 
-Threshold quality on 36 labelled pairs, default lexical embedder:
+| semantic cache outcome | requests |
+|---|---:|
+| exact-repeat hits (an exact-match cache gets these too) | 155 |
+| reworded hits with the correct answer (the similarity layer's benefit) | 5 |
+| wrong answers served (false positives) | 0 |
+| missed rewordings | 5 |
+| first-time misses | 35 |
+
+**80% overall cache hit rate in the benchmark, including exact repeats.** Only 2.5% of
+requests were saved by similarity matching beyond exact matching. Mean latency fell from
+50.5 ms to 10.3 ms; p50 from 50.4 ms to 0.15 ms.
+
+Lowering the threshold to 0.80 on the same workload saves 4 more LLM calls and serves **12
+wrong answers**. Threshold quality on 36 labelled pairs, default lexical embedder:
 
 | threshold | paraphrases served | precision | wrong answers |
 |---:|---:|---:|---:|
@@ -424,8 +504,8 @@ Threshold quality on 36 labelled pairs, default lexical embedder:
 | 0.90 | 56% | 100% | 0 |
 | 0.95 | 50% | 100% | 0 |
 
-These numbers describe a synthetic workload and a small dataset. Your hit rate depends on
-your traffic.
+These numbers describe a small synthetic workload and dataset. Your hit rate depends on your
+traffic.
 
 ## 19. Configuration
 
@@ -438,8 +518,10 @@ All settings are environment variables (or `.env`). Most important:
 | `CACHE_MAX_ENTRIES` | `10000` | LRU eviction above this |
 | `CACHE_MAX_TEMPERATURE` | `1.0` | Requests hotter than this bypass the cache |
 | `CACHE_CLEANUP_INTERVAL_SECONDS` | `60` | Background purge interval (0 = off) |
-| `VECTOR_STORE_PATH` | empty (memory only) | Directory to persist the index on shutdown |
-| `EMBEDDING_PROVIDER` | `hashing` | `hashing`, `sentence-transformers`, `openai` |
+| `VECTOR_STORE_PATH` | empty (memory only) | Directory to persist the index; empty = lost on restart |
+| `CACHE_SNAPSHOT_INTERVAL_SECONDS` | `30` | Save a changed index this often (plus on shutdown); 0 = shutdown only |
+| `EMBEDDING_PROVIDER` | `hashing` | `hashing` (lexical), `sentence-transformers` (neural), `openai` |
+| `EMBEDDING_MODEL` / `EMBEDDING_DEVICE` | `all-MiniLM-L6-v2` / `cpu` | sentence-transformers only |
 | `LLM_PROVIDER` | `mock` | `mock`, `openai` |
 | `LLM_DEFAULT_MODEL` | `mock-1` | Used when a request says `"model": "default"` |
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` | - / OpenAI | Any OpenAI-compatible server |
@@ -478,16 +560,20 @@ the embedding provider.
   (see [docs/evaluation.md](docs/evaluation.md)). Use `use_cache=false` for anything that must be
   exact or fresh.
 - The default `hashing` embedder is **lexical**: it misses synonyms and is weak on word order.
-  It exists so everything runs offline; use a neural embedder for real traffic.
+  It exists so everything runs offline; use a neural embedder for real traffic, and re-tune the
+  threshold when you do.
+- A false-positive hit repeats: every later identical request gets the same wrong answer until
+  the entry expires or is deleted.
 - In-process cache: each Uvicorn worker has its own cache; no sharing across replicas.
 - Exact O(n) search per context key - fine for tens of thousands of entries, not millions.
 - Single-flight only coalesces *identical* concurrent requests, not concurrent paraphrases.
-- Persistence happens on graceful shutdown; a crash loses entries since the last save.
+- Persistence is a periodic snapshot plus a save on graceful shutdown; a crash loses up to
+  `CACHE_SNAPSHOT_INTERVAL_SECONDS` of new entries. Hit counters are not snapshotted on their own.
 - No streaming responses, no multi-turn conversation caching (only the final user message +
   system prompt are keyed), no built-in rate limiting.
 - Cost figures are estimates from configured prices and (for the mock) estimated tokens.
-- The `sentence-transformers` and real OpenAI paths are covered by mocked tests only; they have
-  not been exercised against the real services in CI.
+- The `sentence-transformers` and real OpenAI paths are covered by mocked tests only; neither has
+  been run against the real model/service yet.
 
 ## 22. Future improvements
 
@@ -496,7 +582,7 @@ the embedding provider.
 - Per-route / per-namespace thresholds and TTLs.
 - Streaming (`stream()` on `LLMProvider`) with cached replay.
 - Multi-turn keys (hash of conversation history).
-- Periodic snapshotting instead of save-on-shutdown.
+- Write-ahead persistence so no entry is lost on a crash.
 
 ## 23. Contributing
 

@@ -31,12 +31,14 @@ class Settings(BaseSettings):
     cache_max_entries: int = Field(default=10_000, ge=1)
     cache_top_k: int = Field(default=5, ge=1, le=100)
     cache_cleanup_interval_seconds: int = Field(default=60, ge=0)
+    cache_snapshot_interval_seconds: int = Field(default=30, ge=0)
     cache_max_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     vector_store_path: str = ""
 
     embedding_provider: Literal["hashing", "sentence-transformers", "openai"] = "hashing"
     embedding_dimensions: int = Field(default=512, ge=16, le=8192)
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_device: str = "cpu"
 
     llm_provider: Literal["mock", "openai"] = "mock"
     llm_default_model: str = "mock-1"

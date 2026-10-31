@@ -278,3 +278,31 @@ async def test_cache_survives_restart_when_vector_store_path_set(tmp_path: Path)
         hit = await client.post("/v1/chat", json={"message": "Explain machine learning"})
         assert hit.json()["cache_hit"] is True
         assert mock_llm_of(second).calls == 0
+
+
+async def test_periodic_snapshot_persists_without_graceful_shutdown(tmp_path: Path) -> None:
+    import asyncio
+
+    store_dir = tmp_path / "store"
+    app = create_app(
+        make_settings(vector_store_path=str(store_dir), cache_snapshot_interval_seconds=1)
+    )
+    async for client in _client_for(app):
+        await client.post("/v1/chat", json={"message": "What is machine learning?"})
+        for _ in range(30):  # the lifespan has not ended, so only the snapshot task can save
+            if (store_dir / "entries.json").exists():
+                break
+            await asyncio.sleep(0.1)
+        assert (store_dir / "entries.json").exists()
+
+
+async def test_changing_default_model_does_not_reuse_old_answers(tmp_path: Path) -> None:
+    store_dir = str(tmp_path / "store")
+    first = create_app(make_settings(vector_store_path=store_dir, llm_default_model="model-a"))
+    async for client in _client_for(first):
+        await client.post("/v1/chat", json={"message": "What is machine learning?"})
+    second = create_app(make_settings(vector_store_path=store_dir, llm_default_model="model-b"))
+    async for client in _client_for(second):
+        result = await client.post("/v1/chat", json={"message": "What is machine learning?"})
+        assert result.json()["cache_hit"] is False
+        assert result.json()["model"] == "model-b"

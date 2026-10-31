@@ -51,11 +51,15 @@ def _env(**extra: str) -> dict[str, str]:
 def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     port = _free_port()
     workdir = tmp_path_factory.mktemp("server")
+    # Server output goes to a file, never an unread pipe: a full pipe buffer (small on
+    # Windows) would block the server and hang the test run.
+    log_path = workdir / "server.log"
+    log_file = log_path.open("wb")
     proc = subprocess.Popen(
         [sys.executable, "-m", "llmops_cache"],
         cwd=workdir,
         env=_env(PORT=str(port), HOST="127.0.0.1"),
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
     )
     url = f"http://127.0.0.1:{port}"
@@ -68,11 +72,13 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             time.sleep(0.2)
     else:
         proc.kill()
-        output = proc.stdout.read().decode() if proc.stdout else ""
-        pytest.fail(f"server did not start:\n{output}")
+        proc.wait(timeout=10)
+        log_file.close()
+        pytest.fail(f"server did not start:\n{log_path.read_text(errors='replace')}")
     yield url
     proc.terminate()
     proc.wait(timeout=10)
+    log_file.close()
 
 
 def test_full_miss_hit_flow_over_http(server: str) -> None:
@@ -160,7 +166,10 @@ def test_cli_reports_unreachable_server() -> None:
     [
         (["examples/demo.py", "--latency-ms", "20"], ["CACHE MISS", "CACHE HIT", "LLM NOT called"]),
         (["scripts/evaluate_threshold.py"], ["| 0.90 |", "recall"]),
-        (["scripts/benchmark.py", "--requests", "40", "--latency-ms", "1"], ["LLM calls reduced"]),
+        (
+            ["scripts/benchmark.py", "--requests", "40", "--latency-ms", "1"],
+            ["overall cache hit rate (includes exact repeats)", "reworded hits"],
+        ),
     ],
 )
 def test_scripts_run_from_repo_root(script: list[str], expected: list[str]) -> None:
@@ -176,3 +185,27 @@ def test_scripts_run_from_repo_root(script: list[str], expected: list[str]) -> N
     assert result.returncode == 0, result.stderr
     for text in expected:
         assert text in result.stdout
+
+
+def test_smoke_test_script_passes_against_live_server(server: str) -> None:
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/smoke_test.py",
+            "--url",
+            server,
+            "--phase",
+            "full",
+            "--ttl-seconds",
+            "1",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=_env(),
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RESULT: PASS" in result.stdout
+    assert "FAIL " not in result.stdout

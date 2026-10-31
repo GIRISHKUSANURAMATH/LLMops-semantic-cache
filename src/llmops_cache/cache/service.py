@@ -164,12 +164,13 @@ class SemanticCache:
     # ----------------------------------------------------------------- internals
     def _context_key(self, request: ChatRequest) -> str:
         return context_key(
-            provider=self.llm.name,
+            provider=self.llm.cache_identity,
             model=request.model,
             system_prompt=request.system_prompt,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             namespace=request.namespace,
+            embedding=self.embedder.name,
         )
 
     def _bypass_reason(self, request: ChatRequest) -> str | None:

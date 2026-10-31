@@ -349,3 +349,67 @@ async def test_prompts_are_not_logged_by_default(cache) -> None:
     output = stream.getvalue()
     assert "cache.hit" in output
     assert "secret medical" not in output
+
+
+# --------------------------------------------------------------------------- identity regressions
+class _EndpointLLM(MockLLMProvider):
+    """Same provider name and model name, different server (e.g. OpenAI vs Groq)."""
+
+    def __init__(self, endpoint: str) -> None:
+        super().__init__(latency_ms=0)
+        self.name = "openai"
+        self._endpoint = endpoint
+
+    @property
+    def cache_identity(self) -> str:
+        return f"openai@{self._endpoint}"
+
+
+async def test_same_model_name_on_different_endpoints_never_shares_cache(clock, metrics):
+    shared = InMemoryVectorStore()
+    first = make_cache(
+        llm=_EndpointLLM("https://api.openai.com/v1"), clock=clock, metrics=metrics, store=shared
+    )
+    second = make_cache(
+        llm=_EndpointLLM("https://api.groq.com/openai/v1"),
+        clock=clock,
+        metrics=metrics,
+        store=shared,
+    )
+    await first.chat(req("What is machine learning?"))
+    result = await second.chat(req("What is machine learning?"))
+    assert result.cache_hit is False
+    assert second.llm.calls == 1
+
+
+async def test_entries_from_another_embedding_model_are_not_matched(llm, clock, metrics):
+    from llmops_cache.embeddings import HashingEmbeddingProvider
+
+    shared = InMemoryVectorStore()
+    a = make_cache(
+        llm=llm,
+        clock=clock,
+        metrics=metrics,
+        store=shared,
+        embedder=HashingEmbeddingProvider(dimensions=512),
+    )
+    b = make_cache(
+        llm=llm,
+        clock=clock,
+        metrics=metrics,
+        store=shared,
+        embedder=HashingEmbeddingProvider(dimensions=512),
+    )
+    b.embedder.name = "some-other-model"  # same vector space shape, different model identity
+    await a.chat(req("What is machine learning?"))
+    assert (await b.chat(req("What is machine learning?"))).cache_hit is False
+
+
+def test_openai_provider_identity_includes_endpoint() -> None:
+    from llmops_cache.providers.openai_compat import OpenAICompatibleProvider
+
+    one = OpenAICompatibleProvider(api_key="k", base_url="https://api.openai.com/v1/")
+    two = OpenAICompatibleProvider(api_key="k", base_url="http://localhost:11434/v1")
+    assert one.cache_identity == "openai@https://api.openai.com/v1"
+    assert one.cache_identity != two.cache_identity
+    assert "k" not in one.cache_identity.split("@")[0]

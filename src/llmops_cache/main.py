@@ -63,10 +63,28 @@ async def _cleanup_loop(cache: SemanticCache, interval: int) -> None:
             logger.exception("cache.cleanup_failed")
 
 
+async def _snapshot_loop(cache: SemanticCache, path: Path, interval: int) -> None:
+    """Persist the index periodically so a crash or hard kill loses at most ``interval`` s."""
+    store = cache.store
+    assert isinstance(store, InMemoryVectorStore)  # noqa: S101 - checked by caller
+    saved_version = store.version
+    while True:
+        await asyncio.sleep(interval)
+        if store.version == saved_version:
+            continue
+        try:
+            current = store.version
+            store.save(path, cache.embedder.name)
+            saved_version = current
+            logger.info("cache.snapshot", extra={"entries": len(store)})
+        except Exception:
+            logger.exception("cache.snapshot_failed")
+
+
 def create_app(settings: Settings | None = None, cache: SemanticCache | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level, settings.log_json)
-    cache = cache or build_cache(settings)
+    cache = cache if cache is not None else build_cache(settings)
     store_path = Path(settings.vector_store_path) if settings.vector_store_path else None
 
     @asynccontextmanager
@@ -75,10 +93,17 @@ def create_app(settings: Settings | None = None, cache: SemanticCache | None = N
             loaded = cache.store.load(store_path, cache.embedder.name, now=time.time())
             cache.metrics.set_entries(len(cache.store))
             logger.info("cache.loaded", extra={"entries": loaded, "path": str(store_path)})
-        cleanup = None
+        tasks: list[asyncio.Task[None]] = []
         if settings.cache_cleanup_interval_seconds > 0:
-            cleanup = asyncio.create_task(
-                _cleanup_loop(cache, settings.cache_cleanup_interval_seconds)
+            tasks.append(
+                asyncio.create_task(_cleanup_loop(cache, settings.cache_cleanup_interval_seconds))
+            )
+        persist = store_path is not None and isinstance(cache.store, InMemoryVectorStore)
+        if persist and store_path and settings.cache_snapshot_interval_seconds > 0:
+            tasks.append(
+                asyncio.create_task(
+                    _snapshot_loop(cache, store_path, settings.cache_snapshot_interval_seconds)
+                )
             )
         logger.info(
             "app.started",
@@ -91,10 +116,10 @@ def create_app(settings: Settings | None = None, cache: SemanticCache | None = N
         try:
             yield
         finally:
-            if cleanup:
-                cleanup.cancel()
+            for task in tasks:
+                task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await cleanup
+                    await task
             if store_path and isinstance(cache.store, InMemoryVectorStore):
                 cache.store.save(store_path, cache.embedder.name)
                 logger.info("cache.saved", extra={"entries": len(cache.store)})

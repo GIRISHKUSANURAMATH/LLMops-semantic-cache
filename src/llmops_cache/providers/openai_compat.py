@@ -29,11 +29,18 @@ class OpenAICompatibleProvider(LLMProvider):
         timeout: float = 30.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        self._base_url = base_url.rstrip("/")
         self._client = client or httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=timeout,
         )
+
+    @property
+    def cache_identity(self) -> str:
+        # Same model name on different servers (OpenAI vs Groq vs a local vLLM) is a
+        # different model, so the endpoint is part of the cache identity.
+        return f"{self.name}@{self._base_url}"
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         messages: list[dict[str, str]] = []
