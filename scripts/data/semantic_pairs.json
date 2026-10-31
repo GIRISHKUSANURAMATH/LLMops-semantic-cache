@@ -1,0 +1,43 @@
+{
+  "description": "Query pairs for threshold evaluation. label: equivalent = a cached answer is correct to reuse; related = same topic but needs a different answer; unrelated = different topic.",
+  "pairs": [
+    {"a": "What is machine learning?", "b": "Explain machine learning to me.", "label": "equivalent"},
+    {"a": "What is Python?", "b": "Explain Python programming.", "label": "equivalent"},
+    {"a": "What is the capital of France?", "b": "Tell me the capital city of France", "label": "equivalent"},
+    {"a": "How do I reverse a list in Python?", "b": "How can I reverse a Python list?", "label": "equivalent"},
+    {"a": "What is Docker?", "b": "Can you explain what Docker is?", "label": "equivalent"},
+    {"a": "Define photosynthesis", "b": "What is photosynthesis?", "label": "equivalent"},
+    {"a": "How does HTTPS work?", "b": "Explain how HTTPS works", "label": "equivalent"},
+    {"a": "What are the benefits of unit testing?", "b": "Why is unit testing beneficial?", "label": "equivalent"},
+    {"a": "How do I create a virtual environment in Python?", "b": "Create a Python virtual environment - how?", "label": "equivalent"},
+    {"a": "What is a REST API?", "b": "Explain REST APIs", "label": "equivalent"},
+    {"a": "What is the time complexity of binary search?", "b": "Binary search time complexity?", "label": "equivalent"},
+    {"a": "How do I install numpy?", "b": "How can I install NumPy?", "label": "equivalent"},
+    {"a": "What causes rain?", "b": "Why does it rain?", "label": "equivalent"},
+    {"a": "Who wrote Hamlet?", "b": "Who is the author of Hamlet?", "label": "equivalent"},
+    {"a": "What is a car?", "b": "Describe an automobile", "label": "equivalent"},
+    {"a": "Convert Celsius to Fahrenheit", "b": "How do I convert Celsius into Fahrenheit?", "label": "equivalent"},
+
+    {"a": "How do I reset my password?", "b": "How do I reset my password if I lost access to my email?", "label": "related"},
+    {"a": "What is machine learning?", "b": "What is machine learning used for?", "label": "related"},
+    {"a": "What is machine learning?", "b": "What is deep learning?", "label": "related"},
+    {"a": "How do I sort a list in Python?", "b": "How do I sort a dictionary in Python?", "label": "related"},
+    {"a": "How do I reverse a list in Python?", "b": "How do I reverse a string in Python?", "label": "related"},
+    {"a": "What is the capital of France?", "b": "What is the capital of Germany?", "label": "related"},
+    {"a": "How do I install numpy on Windows?", "b": "How do I install numpy on macOS?", "label": "related"},
+    {"a": "What is Python 2?", "b": "What is Python 3?", "label": "related"},
+    {"a": "Is it safe to take ibuprofen?", "b": "Is it safe to take ibuprofen during pregnancy?", "label": "related"},
+    {"a": "Convert Celsius to Fahrenheit", "b": "Convert Fahrenheit to Celsius", "label": "related"},
+    {"a": "How do I delete a git branch?", "b": "How do I delete a remote git branch?", "label": "related"},
+    {"a": "What is the time complexity of binary search?", "b": "What is the space complexity of binary search?", "label": "related"},
+
+    {"a": "What is Python?", "b": "What is the capital of France?", "label": "unrelated"},
+    {"a": "What is machine learning?", "b": "How do I bake bread?", "label": "unrelated"},
+    {"a": "How does HTTPS work?", "b": "Who wrote Hamlet?", "label": "unrelated"},
+    {"a": "What is Docker?", "b": "Why does it rain?", "label": "unrelated"},
+    {"a": "How do I reset my password?", "b": "What is photosynthesis?", "label": "unrelated"},
+    {"a": "Define recursion", "b": "Best hiking trails in Karnataka", "label": "unrelated"},
+    {"a": "What is a REST API?", "b": "How many players are on a cricket team?", "label": "unrelated"},
+    {"a": "How do I install numpy?", "b": "What is the boiling point of water?", "label": "unrelated"}
+  ]
+}

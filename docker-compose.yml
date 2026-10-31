@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: llmops-semantic-cache:latest
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+      VECTOR_STORE_PATH: /app/data/vector_store
+    volumes:
+      - cache-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  cache-data:
