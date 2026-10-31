@@ -47,16 +47,53 @@ $Servers = New-Object System.Collections.Generic.List[object]
 $script:LastOutput = ''
 $StartTime = Get-Date
 
-Set-Content -LiteralPath $LogFile -Encoding UTF8 -Value @(
-    'llmops-semantic-cache - Windows verification log',
-    "started:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')",
-    "project:  $ProjectRoot",
-    "temp dir: $TempRoot"
-)
+# --- only one verification at a time --------------------------------------------------
+# Two runs writing the same log interleave their results and make Add-Content fail with
+# "Stream was not readable". Refuse to start instead (never kills anything).
+$others = @()
+try {
+    $others = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction Stop |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match 'verify_windows\.ps1' })
+} catch { $others = @() }
+$script:Mutex = New-Object System.Threading.Mutex($false, 'Local\llmops-semantic-cache-verify')
+$haveLock = $false
+try { $haveLock = $script:Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
+if ($others.Count -gt 0 -or -not $haveLock) {
+    Write-Host ''
+    Write-Host 'ANOTHER VERIFICATION IS STILL RUNNING - not starting a second one.' -ForegroundColor Yellow
+    foreach ($o in $others) {
+        Write-Host ("  PID {0}, started {1}: {2}" -f $o.ProcessId, $o.CreationDate, $o.CommandLine)
+    }
+    Write-Host 'Wait for it to print its summary, or close that PowerShell window, then run this again.'
+    if ($haveLock) { $script:Mutex.ReleaseMutex() }
+    Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    exit 3
+}
+
+# --- the log is opened ONCE for the whole run: write access for this script only, other
+#     programs (editors, the Claude app) may still read it while it runs.
+try {
+    $logStream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Create,
+        [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+} catch {
+    Write-Host "Cannot open $LogFile for writing: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host 'Close any program that is writing to it and run again.'
+    $script:Mutex.ReleaseMutex()
+    exit 4
+}
+$script:LogWriter = New-Object System.IO.StreamWriter($logStream, (New-Object System.Text.UTF8Encoding($true)))
+$script:LogWriter.AutoFlush = $true
+foreach ($line in @(
+        'llmops-semantic-cache - Windows verification log',
+        "started:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')   (PID $PID)",
+        "project:  $ProjectRoot",
+        "temp dir: $TempRoot")) {
+    $script:LogWriter.WriteLine($line)
+}
 
 # ----------------------------------------------------------------------------- helpers
 function Write-Log([string]$Text) {
-    Add-Content -LiteralPath $LogFile -Encoding UTF8 -Value $Text
+    $script:LogWriter.WriteLine($Text)
     Write-Host $Text
 }
 
@@ -75,24 +112,32 @@ function Add-Result([string]$Check, [string]$Status, [string]$Detail = '') {
 function Invoke-Logged {
     param([string]$Exe, [string[]]$Arguments = @(), [string]$WorkDir = $ProjectRoot)
     Write-Log ("PS> {0} {1}" -f $Exe, ($Arguments -join ' '))
-    Write-Log ("    (in {0})" -f $WorkDir)
+    Write-Log ("    (in {0}; started {1})" -f $WorkDir, (Get-Date -Format 'HH:mm:ss'))
     $code = -1
-    $output = @()
+    $lines = New-Object System.Collections.Generic.List[string]
+    $began = Get-Date
     Push-Location -LiteralPath $WorkDir
     try {
         $global:LASTEXITCODE = 0
-        $output = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        # Lines are logged AS THEY ARRIVE, so long installs visibly progress and the log
+        # shows exactly where a run is if it stops.
+        & $Exe @Arguments 2>&1 | ForEach-Object {
+            $line = "$_"
+            if ($line -eq 'System.Management.Automation.RemoteException') { $line = '' }
+            $lines.Add($line)
+            Write-Log $line
+        }
         $code = $LASTEXITCODE
         if ($null -eq $code) { $code = 0 }
     } catch {
-        $output = @("ERROR: $($_.Exception.Message)")
+        $lines.Add("ERROR: $($_.Exception.Message)")
+        Write-Log "ERROR: $($_.Exception.Message)"
         $code = -1
     } finally {
         Pop-Location
     }
-    if ($output) { Write-Log (($output) -join [Environment]::NewLine) }
-    Write-Log "exit code: $code"
-    $script:LastOutput = ($output -join "`n")
+    Write-Log ("exit code: {0}   ({1:n1} s)" -f $code, ((Get-Date) - $began).TotalSeconds)
+    $script:LastOutput = ($lines -join "`n")
     return $code
 }
 
@@ -310,9 +355,37 @@ if ($GitExe) {
             Add-Result 'Git repository initialised' 'FAIL' 'no .git, no bundle, and git user.name/user.email not configured - not committing'
         }
     } else {
-        Write-Log '.git already exists: not modifying history.'
-        if (Test-Path -LiteralPath (Join-Path $ProjectRoot '_setup')) {
-            Write-Log 'WARNING: _setup still exists next to an existing .git; leaving it untouched.'
+        Write-Log '.git already exists.'
+        if (Test-Path -LiteralPath $bundle) {
+            # A newer bundle may carry commits the remote-file tools could not write into .git.
+            # Apply it ONLY as a fast-forward of your current main: no rewrite, no merge, and
+            # working files are not touched (they already contain the new versions).
+            Write-Log 'Found _setup bundle: checking whether it fast-forwards your main branch.'
+            $v = Invoke-Logged -Exe $GitExe -Arguments @('bundle', 'verify', $bundle)
+            $f = Invoke-Logged -Exe $GitExe -Arguments @('fetch', $bundle, 'main')
+            if ($v -eq 0 -and $f -eq 0) {
+                & $GitExe merge-base --is-ancestor HEAD FETCH_HEAD 2>$null
+                $isAncestor = ($LASTEXITCODE -eq 0)
+                & $GitExe diff --quiet HEAD FETCH_HEAD 2>$null
+                $sameTree = ($LASTEXITCODE -eq 0)
+                if ($sameTree) {
+                    Write-Log 'bundle main has the same content as your main: nothing to apply.'
+                    Add-Result 'Git: _setup bundle already applied' 'PASS'
+                } elseif ($isAncestor) {
+                    Invoke-Logged -Exe $GitExe -Arguments @('log', '--format=%h | author: %an <%ae> | %s', 'HEAD..FETCH_HEAD') | Out-Null
+                    $r = Invoke-Logged -Exe $GitExe -Arguments @('reset', '--mixed', 'FETCH_HEAD')
+                    Add-Result 'Git: fast-forwarded main to the _setup bundle' $(if ($r -eq 0) { 'PASS' } else { 'FAIL' })
+                } else {
+                    Add-Result 'Git: _setup bundle' 'FAIL' 'bundle is not a fast-forward of your main; left untouched'
+                }
+                if ($sameTree -or $isAncestor) {
+                    New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
+                    Move-Item -LiteralPath (Join-Path $ProjectRoot '_setup') -Destination $BackupRoot
+                    Write-Log "moved _setup to $BackupRoot (backup; not deleted)"
+                }
+            } else {
+                Add-Result 'Git: _setup bundle' 'FAIL' 'bundle could not be verified/fetched'
+            }
         }
     }
 
@@ -364,8 +437,8 @@ if ($PyExe) {
     Add-Result 'Create fresh .venv' $(if ($c -eq 0 -and (Test-Path -LiteralPath $VenvPy)) { 'PASS' } else { 'FAIL' })
     if (Test-Path -LiteralPath $VenvPy) {
         Invoke-Logged -Exe $VenvPy -Arguments @('-c', "import sys; print('isolated venv:', sys.prefix != sys.base_prefix, sys.prefix)") | Out-Null
-        Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip') | Out-Null
-        $c = Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'install', '-e', '.[dev]')
+        Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', '--upgrade', 'pip') | Out-Null
+        $c = Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', '-e', '.[dev]')
         $InstallOk = ($c -eq 0)
         Add-Result 'pip install -e ".[dev]"' $(if ($InstallOk) { 'PASS' } else { 'FAIL' })
         $c = Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'check')
@@ -402,7 +475,7 @@ if ($InstallOk) {
 # ============================================================================= SECURITY
 Write-Section 'SECURITY'
 if ($InstallOk) {
-    $c = Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'install', 'pip-audit')
+    $c = Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', 'pip-audit')
     if ($c -eq 0) {
         $c = Invoke-Logged -Exe $VenvPy -Arguments @('-m', 'pip_audit', '--skip-editable')
         if ($c -eq 0) { Add-Result 'pip-audit (known CVEs in installed deps)' 'PASS' }
@@ -556,8 +629,8 @@ if ($SkipNeural) {
     $env:HF_HOME = Join-Path $TempRoot 'hf-cache'   # keep the model out of your user profile
     Write-Log "Separate venv: $NeuralVenv (so PyTorch never touches .venv). HF_HOME=$env:HF_HOME"
     Invoke-Logged -Exe $PyExe -Arguments ($PyPrefix + @('-m', 'venv', $NeuralVenv)) | Out-Null
-    Invoke-Logged -Exe $NeuralPy -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip') | Out-Null
-    $c = Invoke-Logged -Exe $NeuralPy -Arguments @('-m', 'pip', 'install', '-e', '.[sentence-transformers,dev]')
+    Invoke-Logged -Exe $NeuralPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', '--upgrade', 'pip') | Out-Null
+    $c = Invoke-Logged -Exe $NeuralPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', '-e', '.[sentence-transformers,dev]')
     if ($c -ne 0) {
         Add-Result 'pip install -e ".[sentence-transformers]"' 'FAIL' 'see output above'
         Add-Result 'NEURAL MODEL' 'NOT VERIFIED' 'install failed'
@@ -640,8 +713,8 @@ if ($SkipFreshClone) {
         Invoke-Logged -Exe $GitExe -Arguments @('-C', $Fresh, 'ls-files') | Out-Null
         $FreshPy = Join-Path $Fresh '.venv\Scripts\python.exe'
         $c = Invoke-Logged -Exe $PyExe -Arguments ($PyPrefix + @('-m', 'venv', '.venv')) -WorkDir $Fresh
-        $c = Invoke-Logged -Exe $FreshPy -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip') -WorkDir $Fresh
-        $c = Invoke-Logged -Exe $FreshPy -Arguments @('-m', 'pip', 'install', '-e', '.[dev]') -WorkDir $Fresh
+        $c = Invoke-Logged -Exe $FreshPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', '--upgrade', 'pip') -WorkDir $Fresh
+        $c = Invoke-Logged -Exe $FreshPy -Arguments @('-m', 'pip', 'install', '--progress-bar', 'off', '--no-input', '-e', '.[dev]') -WorkDir $Fresh
         Add-Result 'Fresh clone: venv + pip install -e ".[dev]"' $(if ($c -eq 0) { 'PASS' } else { 'FAIL' })
         Copy-Item -LiteralPath (Join-Path $Fresh '.env.example') -Destination (Join-Path $Fresh '.env')
         Write-Log 'copied .env.example -> .env (README step)'
@@ -708,3 +781,5 @@ if ($failed.Count -eq 0) {
 }
 Write-Log ("finished: {0}  (duration {1:n0} s)" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'), ((Get-Date) - $StartTime).TotalSeconds)
 Write-Log "log file: $LogFile"
+$script:LogWriter.Close()
+try { $script:Mutex.ReleaseMutex() } catch { }
