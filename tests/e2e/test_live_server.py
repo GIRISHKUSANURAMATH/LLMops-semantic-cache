@@ -21,6 +21,16 @@ pytestmark = pytest.mark.e2e
 
 ROOT = Path(__file__).resolve().parents[2]
 
+MOCK_LLM_LATENCY_MS = 200
+# uvloop (installed by uvicorn[standard] on Linux/macOS) schedules timers from a millisecond
+# clock cached at the start of each loop iteration, so a 200 ms mock-LLM sleep can measure up
+# to ~1 ms short (CI saw 199.905 ms). Allow a small tolerance; the cache behaviour itself is
+# asserted exactly via the server's LLM-call counter, not via timing.
+TIMER_TOLERANCE_MS = 10
+# A cache hit must be far cheaper than one LLM call (typically ~1 ms); this bound leaves
+# headroom for slow, shared CI runners while still failing if a "hit" calls the LLM.
+MAX_HIT_LATENCY_MS = MOCK_LLM_LATENCY_MS / 4
+
 
 def _free_port() -> int:
     with socket.socket() as sock:
@@ -37,7 +47,7 @@ def _env(**extra: str) -> dict[str, str]:
     env.update(
         {
             "LLM_PROVIDER": "mock",
-            "MOCK_LLM_LATENCY_MS": "200",
+            "MOCK_LLM_LATENCY_MS": str(MOCK_LLM_LATENCY_MS),
             "LOG_LEVEL": "WARNING",
             "VECTOR_STORE_PATH": "",
             "PYTHONIOENCODING": "utf-8",
@@ -83,15 +93,30 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 
 def test_full_miss_hit_flow_over_http(server: str) -> None:
     with httpx.Client(base_url=server, timeout=10) as client:
-        assert client.delete("/v1/cache").status_code == 200
-        miss = client.post("/v1/chat", json={"message": "What is machine learning?"}).json()
-        hit = client.post("/v1/chat", json={"message": "Explain machine learning to me."}).json()
-        other = client.post("/v1/chat", json={"message": "What is the capital of France?"}).json()
 
-        assert miss["cache_hit"] is False and miss["latency_ms"] >= 200
-        assert hit["cache_hit"] is True and hit["source"] == "semantic_cache"
-        assert hit["latency_ms"] < miss["latency_ms"] / 10
-        assert other["cache_hit"] is False
+        def llm_calls() -> int:
+            return int(client.get("/v1/metrics").json()["llm_calls"])
+
+        def chat(message: str) -> tuple[dict[str, object], int]:
+            before = llm_calls()
+            body = client.post("/v1/chat", json={"message": message}).json()
+            return body, llm_calls() - before
+
+        assert client.delete("/v1/cache").status_code == 200
+        miss, miss_calls = chat("What is machine learning?")
+        hit, hit_calls = chat("Explain machine learning to me.")
+        other, other_calls = chat("What is the capital of France?")
+
+        # Behaviour: asserted exactly, independent of timing.
+        assert miss["cache_hit"] is False and miss["source"] == "llm" and miss_calls == 1
+        assert hit["cache_hit"] is True and hit["source"] == "semantic_cache" and hit_calls == 0
+        assert hit["response"] == miss["response"]
+        assert other["cache_hit"] is False and other_calls == 1
+
+        # Latency: a miss pays for the (mock) LLM call, a hit does not.
+        assert float(miss["latency_ms"]) >= MOCK_LLM_LATENCY_MS - TIMER_TOLERANCE_MS, miss
+        assert float(hit["latency_ms"]) < MAX_HIT_LATENCY_MS, hit
+        assert float(hit["latency_ms"]) < float(miss["latency_ms"])
 
         stats = client.get("/v1/cache/stats").json()
         assert stats["entries_count"] == 2
